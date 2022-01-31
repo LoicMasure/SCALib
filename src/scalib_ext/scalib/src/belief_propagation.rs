@@ -14,6 +14,7 @@ use rayon::prelude::*;
 use realfft::RealFftPlanner;
 use rustfft::num_complex::Complex;
 use std::convert::TryInto;
+use mod_exp::mod_exp;
 
 /// Statistical distribution of a Para node.
 /// Axes are (id of the copy of the var, value of the field element).
@@ -106,6 +107,67 @@ fn fwht(a: &mut [f64], len: usize) {
         h *= 2;
     }
 }
+
+/// Find the prime factors of an integer.
+pub fn prime_factors(order: u32) -> Vec<u32> {
+    let sqrt_order = (order as f64).sqrt();
+    let mut prime_list: Vec<u32> = Vec::new();
+    let mut p_test = 2;
+    let mut ord = order;
+    while ord != 1 && p_test <= (sqrt_order as u32) + 1 {
+        if ord % p_test == 0 {
+            // p_test is a prime factor
+            prime_list.push(p_test);
+            ord /= p_test;
+        }
+        else {
+            p_test += 1;
+        }
+    }
+    prime_list
+}
+
+/// Test whether an integer h is a generator in Z_(q+1)^*.
+/// Source: Algorithm B.18 in Katz & Lindell
+pub fn test_gen(q: u32, prime_list: &Vec<u32>, h: u32) -> bool {
+    for prime in prime_list.iter() {
+        let exp = q / prime;
+        let prod = mod_exp(h, exp, q+1);
+        if prod == 1 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Finds a list of generators in Z_p^*
+pub fn find_gen(p: u32) -> Vec<u32> {
+    let order = p-1;
+    let mut gen_list: Vec<u32> = Vec::new();
+
+    // Prime factors part
+    let prime_list = prime_factors(order);
+
+    // Generator part
+    for i in 1..order {
+        let gen: u32 = i;
+        if test_gen(order, &prime_list, gen) {
+            gen_list.push(i);
+        }
+    }
+    gen_list
+}
+
+/// Generates a lookup table of discrete logarithm in Z_p^*
+pub fn gen_log_table(p: u32) -> Vec<u32> {
+    let gen_list = find_gen(p);
+    let mut log_table: Vec<u32> = Vec::new();
+    for j in 0..p-1 {
+        log_table.push(mod_exp(gen_list[0], j, p));
+    }
+    log_table
+}
+
 
 /// Make it such that the sum of the probabilities in the distribution is 1.0.
 /// `distri` can be a ParaDistri or a SingleDistri.
@@ -201,7 +263,7 @@ pub fn update_functions(functions: &[Func], edges: &mut [Vec<&mut Array2<f64>>])
         .for_each(|(function, edge)| match &function.functype {
             // TODO: if nc is prime, the update for MUL can be computed more efficiently by mapping
             // classes to their discrete logarithm, and by applying FFT.
-            FuncType::AND | FuncType::MUL => {
+            FuncType::AND => [ // | FuncType::MUL => {
                 let [output_msg, input1_msg, input2_msg]: &mut [_; 3] =
                     edge.as_mut_slice().try_into().unwrap();
                 let nc = input1_msg.shape()[1];
@@ -247,6 +309,9 @@ pub fn update_functions(functions: &[Func], edges: &mut [Vec<&mut Array2<f64>>])
             }
             FuncType::XOR => {
                 xors(edge.as_mut());
+            }
+            FuncType::MUL => {
+                mults(edge.as_mut());
             }
             FuncType::XORCST(values)
             | FuncType::ANDCST(values)
@@ -317,6 +382,69 @@ pub fn update_functions(functions: &[Func], edges: &mut [Vec<&mut Array2<f64>>])
 pub fn adds(inputs: &mut [&mut Array2<f64>]) {
     let n_runs = inputs[0].shape()[0];
     let nc = inputs[0].shape()[1];
+        
+    // Sets the FFT operator
+    let mut real_planner = RealFftPlanner::<f64>::new();
+    let r2c = real_planner.plan_fft_forward(nc);
+    let c2r = real_planner.plan_fft_inverse(nc);
+
+    for run in 0..n_runs {
+        let mut spectrums: Vec<Array1<Complex<f64>>> = Vec::new();
+        let mut acc = Array1::<Complex<f64>>::ones(nc / 2 + 1);
+        inputs.iter_mut().for_each(|input| {
+            let mut input = input.slice_mut(s![run, ..]);
+            let input_fft_s = input.as_slice_mut().unwrap();
+            let mut spectrum = Array1::<Complex<f64>>::zeros(nc / 2 + 1);
+            let spec = spectrum.as_slice_mut().unwrap();
+            // Computes the FFT
+            r2c.process(input_fft_s, spec).unwrap();
+            // Clips the transformed
+            spectrum.mapv_inplace(|x| {
+                if x.norm_sqr() == 0.0 {
+                    Complex::new(MIN_PROBA, MIN_PROBA)
+                } else {
+                    x
+                }
+            });
+            spectrums.push(spectrum);
+            // Accumulates through the operands
+            acc.zip_mut_with(&spectrums[spectrums.len() - 1], |x, y| *x = *x * y);
+            acc /= acc.sum();
+        });
+        assert_eq!(inputs.len(), spectrums.len());
+        // Invert accumulation input_wise and invert transform.
+        spectrums
+            .iter_mut()
+            .zip(inputs.iter_mut())
+            .for_each(|(spectrum, input)| {
+                let mut input = input.slice_mut(s![run, ..]);
+                spectrum.zip_mut_with(&acc, |x, y| *x = *y / *x);
+                let input_fft_s = input.as_slice_mut().unwrap();
+                let spec = spectrum.as_slice_mut().unwrap();
+                c2r.process(spec, input_fft_s).unwrap();
+                make_non_zero(&mut input);
+                let s = input.sum();
+                input /= s;
+                make_non_zero(&mut input);
+            });
+    }
+}
+
+/// Compute a MULT function node between all edges.
+/// Only works if nc is a prime number.
+pub fn mults(inputs: &mut [&mut Array2<f64>]) {
+    let n_runs = inputs[0].shape()[0];
+    let nc = inputs[0].shape()[1];
+    
+    // Gets the log table
+    assert_eq!(prime_factors(nc).len(), 0);
+    let log_table: Vec<u32> = gen_log_table(nc);
+
+    // Applies the log permutation
+    let mut alogs: Vec<Array2<f64>> = Vec::New();
+    inputs.iter_mut().for_each(|input| {
+        println
+    })
 
     // Sets the FFT operator
     let mut real_planner = RealFftPlanner::<f64>::new();
