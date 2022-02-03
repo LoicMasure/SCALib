@@ -228,8 +228,8 @@ def test_MUL():
     """
     Test MUL between distributions
     """
-    nc = 251
-    n = 4
+    nc = 31
+    n = 10
     distri_x = np.random.randint(1, 10000000, (n, nc))
     distri_x = (distri_x.T / np.sum(distri_x, axis=1)).T
     distri_y = np.random.randint(1, 10000000, (n, nc))

@@ -263,46 +263,8 @@ pub fn update_functions(functions: &[Func], edges: &mut [Vec<&mut Array2<f64>>])
         .for_each(|(function, edge)| match &function.functype {
             // TODO: if nc is prime, the update for MUL can be computed more efficiently by mapping
             // classes to their discrete logarithm, and by applying FFT.
-            FuncType::AND => [ // | FuncType::MUL => {
-                let [output_msg, input1_msg, input2_msg]: &mut [_; 3] =
-                    edge.as_mut_slice().try_into().unwrap();
-                let nc = input1_msg.shape()[1];
-                (
-                    input1_msg.outer_iter_mut(),
-                    input2_msg.outer_iter_mut(),
-                    output_msg.outer_iter_mut(),
-                )
-                    .into_par_iter()
-                    // Use for_each_init to limit the number of a allocation of the message
-                    // scratch-pad.
-                    .for_each_init(
-                        || (Array1::zeros(nc), Array1::zeros(nc), Array1::zeros(nc)),
-                        |(in1_msg_scratch, in2_msg_scratch, out_msg_scratch),
-                         (mut input1_msg, mut input2_msg, mut output_msg)| {
-                            in1_msg_scratch.fill(0.0);
-                            in2_msg_scratch.fill(0.0);
-                            out_msg_scratch.fill(0.0);
-
-                            for i1 in 0..nc {
-                                for i2 in 0..nc {
-                                    // Unifies operators that can only be binary
-                                    let o = match &function.functype {
-                                        FuncType::AND => i1 & i2,
-                                        FuncType::MUL => {
-                                            (((i1 * i2) as u32) % (nc as u32)) as usize
-                                        }
-                                        _ => unreachable!(),
-                                    };
-                                    in1_msg_scratch[i1] += input2_msg[i2] * output_msg[o];
-                                    in2_msg_scratch[i2] += input1_msg[i1] * output_msg[o];
-                                    out_msg_scratch[o] += input1_msg[i1] * input2_msg[i2];
-                                }
-                            }
-                            input1_msg.assign(in1_msg_scratch);
-                            input2_msg.assign(in2_msg_scratch);
-                            output_msg.assign(out_msg_scratch);
-                        },
-                    );
+            FuncType::AND => {
+                naive(edge.as_mut(), &function.functype);
             }
             FuncType::ADD => {
                 adds(edge.as_mut());
@@ -311,7 +273,13 @@ pub fn update_functions(functions: &[Func], edges: &mut [Vec<&mut Array2<f64>>])
                 xors(edge.as_mut());
             }
             FuncType::MUL => {
-                mults(edge.as_mut());
+                let nc = edge[0].shape()[1];
+                if prime_factors(nc.try_into().unwrap()).len() == 0 {
+                    // Fast transform only works when nc is prime.
+                    mults(edge.as_mut());
+                } else {
+                    naive(edge.as_mut(), &function.functype);
+                }
             }
             FuncType::XORCST(values)
             | FuncType::ANDCST(values)
@@ -377,6 +345,47 @@ pub fn update_functions(functions: &[Func], edges: &mut [Vec<&mut Array2<f64>>])
             }
         });
 }
+pub fn naive(inputs: &mut [&mut Array2<f64>], functype: &FuncType) {
+    let [output_msg, input1_msg, input2_msg]: &mut [_; 3] =
+        inputs.try_into().unwrap();
+    let nc = input1_msg.shape()[1];
+    (
+        input1_msg.outer_iter_mut(),
+        input2_msg.outer_iter_mut(),
+        output_msg.outer_iter_mut(),
+    )
+        .into_par_iter()
+        // Use for_each_init to limit the number of a allocation of the message
+        // scratch-pad.
+        .for_each_init(
+            || (Array1::zeros(nc), Array1::zeros(nc), Array1::zeros(nc)),
+            |(in1_msg_scratch, in2_msg_scratch, out_msg_scratch),
+            (mut input1_msg, mut input2_msg, mut output_msg)| {
+                in1_msg_scratch.fill(0.0);
+                in2_msg_scratch.fill(0.0);
+                out_msg_scratch.fill(0.0);
+
+                for i1 in 0..nc {
+                    for i2 in 0..nc {
+                        // Unifies operators that can only be binary
+                        let o = match functype {
+                            FuncType::AND => i1 & i2,
+                            FuncType::MUL => {
+                                (((i1 * i2) as u32) % (nc as u32)) as usize
+                            }
+                            _ => unreachable!(),
+                        };
+                        in1_msg_scratch[i1] += input2_msg[i2] * output_msg[o];
+                        in2_msg_scratch[i2] += input1_msg[i1] * output_msg[o];
+                        out_msg_scratch[o] += input1_msg[i1] * input2_msg[i2];
+                    }
+                }
+                input1_msg.assign(in1_msg_scratch);
+                input2_msg.assign(in2_msg_scratch);
+                output_msg.assign(out_msg_scratch);
+            },
+            );
+}
 
 /// Compute an ADD function node between all edges.
 pub fn adds(inputs: &mut [&mut Array2<f64>]) {
@@ -433,31 +442,97 @@ pub fn adds(inputs: &mut [&mut Array2<f64>]) {
 /// Compute a MULT function node between all edges.
 /// Only works if nc is a prime number.
 pub fn mults(inputs: &mut [&mut Array2<f64>]) {
+
+    // Deal with the 0-th entry
+    let [output_msg, input1_msg, input2_msg]: &mut [_; 3] =
+        inputs.try_into().unwrap();
+    let nc = input1_msg.shape()[1];
+    (
+        input1_msg.outer_iter_mut(),
+        input2_msg.outer_iter_mut(),
+        output_msg.outer_iter_mut(),
+    )
+        .into_par_iter()
+        // Use for_each_init to limit the number of a allocation of the message
+        // scratch-pad.
+        .for_each_init(
+            || (Array1::zeros(nc), Array1::zeros(nc), Array1::zeros(nc)),
+            |(in1_msg_scratch, in2_msg_scratch, out_msg_scratch),
+            (mut input1_msg, mut input2_msg, mut output_msg)| {
+                out_msg_scratch.fill(0.0);
+                in1_msg_scratch.fill(0.0);
+                in2_msg_scratch.fill(0.0);
+
+                for i1 in 0..1 {
+                    for i2 in 0..nc {
+                        // Unifies operators that can only be binary
+                        let o = (((i1 * i2) as u32) % (nc as u32)) as usize;
+                        assert_eq!(o, 0);
+
+                        in1_msg_scratch[i1] += input2_msg[i2] * output_msg[o];
+                        in2_msg_scratch[i2] += input1_msg[i1] * output_msg[o];
+                        out_msg_scratch[o] += input1_msg[i1] * input2_msg[i2];
+                    }
+                }
+                for i1 in 1..nc {
+                    for i2 in 0..1 {
+                        // Unifies operators that can only be binary
+                        let o = (((i1 * i2) as u32) % (nc as u32)) as usize;
+                        assert_eq!(o, 0);
+
+                        in1_msg_scratch[i1] += input2_msg[i2] * output_msg[o];
+                        in2_msg_scratch[i2] += input1_msg[i1] * output_msg[o];
+                        out_msg_scratch[o] += input1_msg[i1] * input2_msg[i2];
+                    }
+                }
+                input1_msg[0] = in1_msg_scratch[0];
+                input2_msg[0] = in2_msg_scratch[0];
+                output_msg[0]= out_msg_scratch[0];
+            },
+            );
+    // println!("After processing 0-th entry");
+    // inputs.iter_mut().for_each(|input| {
+    //     println!("{}", input);
+    // });
+    // println!("**************************");
+
     let n_runs = inputs[0].shape()[0];
     let nc = inputs[0].shape()[1];
-    
-    // Gets the log table
-    assert_eq!(prime_factors(nc).len(), 0);
-    let log_table: Vec<u32> = gen_log_table(nc);
+    assert_eq!(prime_factors(nc.try_into().unwrap()).len(), 0);
 
-    // Applies the log permutation
-    let mut alogs: Vec<Array2<f64>> = Vec::New();
+    // Gets the log table
+    let log_table: Vec<u32> = gen_log_table(nc.try_into().unwrap());
+
+    // Applies the alog
     inputs.iter_mut().for_each(|input| {
-        println
-    })
+        for run in 0..n_runs {
+            let mut input = input.slice_mut(s![run, ..]);
+            let mut input_perm = input.as_slice_mut().unwrap();
+            let tmp = input_perm.to_vec();
+            for (i, log) in (1..nc).zip(log_table.iter()) {
+                input_perm[i as usize] = tmp[(*log) as usize];
+            }
+        }
+    });
+
+    //println!("Before FFT");
+    //inputs.iter_mut().for_each(|input| {
+    //    println!("{}", input);
+    //});
 
     // Sets the FFT operator
+    let nc_1 = nc-1;
     let mut real_planner = RealFftPlanner::<f64>::new();
-    let r2c = real_planner.plan_fft_forward(nc);
-    let c2r = real_planner.plan_fft_inverse(nc);
+    let r2c = real_planner.plan_fft_forward(nc_1);
+    let c2r = real_planner.plan_fft_inverse(nc_1);
 
     for run in 0..n_runs {
         let mut spectrums: Vec<Array1<Complex<f64>>> = Vec::new();
-        let mut acc = Array1::<Complex<f64>>::ones(nc / 2 + 1);
+        let mut acc = Array1::<Complex<f64>>::ones(nc_1 / 2 + 1);
         inputs.iter_mut().for_each(|input| {
-            let mut input = input.slice_mut(s![run, ..]);
+            let mut input = input.slice_mut(s![run, 1..]);
             let input_fft_s = input.as_slice_mut().unwrap();
-            let mut spectrum = Array1::<Complex<f64>>::zeros(nc / 2 + 1);
+            let mut spectrum = Array1::<Complex<f64>>::zeros(nc_1 / 2 + 1);
             let spec = spectrum.as_slice_mut().unwrap();
             // Computes the FFT
             r2c.process(input_fft_s, spec).unwrap();
@@ -480,17 +555,43 @@ pub fn mults(inputs: &mut [&mut Array2<f64>]) {
             .iter_mut()
             .zip(inputs.iter_mut())
             .for_each(|(spectrum, input)| {
-                let mut input = input.slice_mut(s![run, ..]);
+                let P0 = input.slice_mut(s![run, 0]).as_slice_mut().unwrap().to_vec();
+                let mut input = input.slice_mut(s![run, 1..]);
                 spectrum.zip_mut_with(&acc, |x, y| *x = *y / *x);
                 let input_fft_s = input.as_slice_mut().unwrap();
                 let spec = spectrum.as_slice_mut().unwrap();
                 c2r.process(spec, input_fft_s).unwrap();
                 make_non_zero(&mut input);
                 let s = input.sum();
+                // Normalization is sligthly trickier here ;-)
                 input /= s;
+                input *= (1.0 as f64) - P0[0];
                 make_non_zero(&mut input);
             });
     }
+
+    // println!("After FFT");
+    // inputs.iter_mut().for_each(|input| {
+    //     println!("{}", input);
+    // });
+
+    // Applies the log
+    inputs.iter_mut().for_each(|input| {
+        for run in 0..n_runs {
+            let mut input = input.slice_mut(s![run, ..]);
+            let mut input_perm = input.as_slice_mut().unwrap();
+            let tmp = input_perm.to_vec();
+            for (i, log) in (1..nc).zip(log_table.iter()) {
+                input_perm[(*log) as usize] = tmp[i as usize];
+            }
+        }
+    });
+    // println!("After Permutation");
+    // inputs.iter_mut().for_each(|input| {
+    //     println!("{}", input);
+    // });
+    // println!("**************************");
+
 }
 
 /// Compute a XOR function node between all edges.
